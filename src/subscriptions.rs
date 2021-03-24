@@ -22,6 +22,9 @@ use crate::query::{Query};
 use crate::util::{spawn_thread, SyncChannel, HeaderEntry, FullHash};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::str::from_utf8;
+use std::error::Error;
+
+const TX_SIZE_THRESHOLD: usize = 255_000;
 
 fn get_output_scripthash(txn: &Transaction, n: Option<usize>) -> Vec<FullHash> {
     if let Some(out) = n {
@@ -66,6 +69,10 @@ fn prune_raw_tx(mut raw_tx: Value) -> Value {
         });
 
     serde_json::to_value(raw_tx_mut).unwrap()
+}
+
+fn log_send_error(err_msg: String) {
+    info!("Error while sending message {}", err_msg)
 }
 
 #[derive(Debug)]
@@ -256,7 +263,7 @@ impl SubscriptionsHandler {
             let mut raw_tx = Value::Null;
 
             let pruned_raw_tx = prune_raw_tx(raw_tx_res.unwrap());
-            if pruned_raw_tx.to_string().len() < 255000 {
+            if pruned_raw_tx.to_string().len() < TX_SIZE_THRESHOLD {
                 raw_tx = pruned_raw_tx;
             }
 
@@ -280,15 +287,15 @@ impl SubscriptionsHandler {
         let response = sqs.send_message(send_msg_request).sync();
 
         match response {
-            Ok(res) => debug!("Sent message with body '{}' and created message_id {}", msg_str, res.message_id.unwrap()),
+            Ok(res) => info!("Sent message with body '{}' and created message_id {}", msg_str, res.message_id.unwrap()),
             Err(error) => {
                 match error {
-                    SendMessageError::InvalidMessageContents(invalid_message) => info!("Error while sending message {}", invalid_message),
-                    SendMessageError::UnsupportedOperation(unsupported) => info!("Error while sending message {}", unsupported),
-                    SendMessageError::HttpDispatch(dispatch) => info!("Error while sending message {:?}", dispatch),
-                    SendMessageError::Credentials(creds) => info!("Error while sending message {:?}", creds),
-                    SendMessageError::Validation(validation) => info!("Error while sending message {}", validation),
-                    SendMessageError::ParseError(err) => info!("Error while sending message {}", err),
+                    SendMessageError::InvalidMessageContents(invalid_message) => log_send_error(invalid_message),
+                    SendMessageError::UnsupportedOperation(unsupported) => log_send_error(unsupported),
+                    SendMessageError::HttpDispatch(dispatch) => log_send_error(dispatch.description().to_string()),
+                    SendMessageError::Credentials(creds) => log_send_error(creds.message),
+                    SendMessageError::Validation(validation) => log_send_error(validation),
+                    SendMessageError::ParseError(err) => log_send_error(err),
                     SendMessageError::Unknown(buff_res) => {
                         let error = from_utf8(&buff_res.body).unwrap();
                         info!("Error while sending message {}", error)
@@ -461,7 +468,7 @@ impl SubscriptionsManager {
         let comparison_sender = comparison_handler.chan.sender();
 
         spawn_thread("comparison_handler", move || comparison_handler.handle_request());
-        debug!("comparison_handler created");
+        info!("comparison_handler created");
 
         spawn_thread("subs_handler", move || subs_handler.handle_replies());
         info!("Started SubscriptionsHandler handle_replies");
