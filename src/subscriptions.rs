@@ -5,7 +5,7 @@ use bitcoin::hash_types::{BlockHash, Txid};
 
 use rusoto_core::Region;
 use rusoto_dynamodb::{DynamoDb, DynamoDbClient, ScanInput};
-use rusoto_sqs::{ReceiveMessageRequest, Sqs, SqsClient, DeleteMessageRequest, GetQueueUrlRequest, GetQueueUrlResult, SendMessageRequest};
+use rusoto_sqs::{ReceiveMessageRequest, Sqs, SqsClient, DeleteMessageRequest, GetQueueUrlRequest, GetQueueUrlResult, SendMessageRequest, SendMessageError};
 
 use std::default::Default;
 use std::env;
@@ -21,6 +21,7 @@ use crate::index::compute_script_hash;
 use crate::query::{Query};
 use crate::util::{spawn_thread, SyncChannel, HeaderEntry, FullHash};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::str::from_utf8;
 
 fn get_output_scripthash(txn: &Transaction, n: Option<usize>) -> Vec<FullHash> {
     if let Some(out) = n {
@@ -38,6 +39,33 @@ fn hash_from_value<T: Hash>(val: Option<&Value>) -> Result<T> {
     let script_hash = script_hash.as_str().chain_err(|| "non-string hash")?;
     let script_hash = T::from_hex(script_hash).chain_err(|| "non-hex hash")?;
     Ok(script_hash)
+}
+
+fn prune_raw_tx(mut raw_tx: Value) -> Value {
+    let raw_tx_mut = raw_tx.as_object_mut().unwrap();
+    raw_tx_mut.remove("hash");
+    raw_tx_mut.remove("hex");
+
+    raw_tx_mut["vin"].as_array_mut().unwrap()
+        .iter_mut()
+        .for_each(|vin| {
+            let vin_mut = vin.as_object_mut().unwrap();
+            vin_mut.remove("scriptSig");
+            vin_mut.remove("sequence");
+            vin_mut.remove("txinwitness");
+        });
+
+    raw_tx_mut["vout"].as_array_mut().unwrap()
+        .iter_mut()
+        .for_each(|vout| {
+            let vout_script_pub_key_mut = vout.as_object_mut().unwrap()["scriptPubKey"].as_object_mut().unwrap();
+            vout_script_pub_key_mut.remove("asm");
+            vout_script_pub_key_mut.remove("hex");
+            vout_script_pub_key_mut.remove("reqSigs");
+            vout_script_pub_key_mut.remove("type");
+        });
+
+    serde_json::to_value(raw_tx_mut).unwrap()
 }
 
 #[derive(Debug)]
@@ -74,7 +102,7 @@ impl ScriptHashComparer {
         let now = Instant::now();
         for (i, (scripthash, old_statushash)) in script_hashes.iter().enumerate() {
             if i % 1000 == 0 {
-                debug!("compare_status_hashes: comparing {} out of {}", i, script_hashes.len());
+                info!("compare_status_hashes: comparing {} out of {}", i, script_hashes.len());
             }
 
             let scripthash_buffer = scripthash.into_inner();
@@ -100,7 +128,7 @@ impl ScriptHashComparer {
     }
 
     pub fn handle_request(&mut self) -> Result<()> {
-        debug!("compare_status_hashes listener started");
+        info!("compare_status_hashes listener started");
         loop {
             let msg = self.chan.receiver().recv().chain_err(|| "channel closed")?;
             match msg {
@@ -155,17 +183,20 @@ impl SubscriptionsHandler {
             .sync()
             .expect("Get queue by URL request failed");
 
+        info!("Using notification queue url: {:?}", response.queue_url);
+
         response.queue_url
             .expect("Queue url should be available from list queues")
     }
 
     fn subscribe_script_hash(&mut self, script_hash: String) -> Result<()> {
         let script_hash = Sha256dHash::from_hex(script_hash.as_str()).chain_err(|| "bad script_hash")?;
+        info!("Received message to subscribe script_hash: {}", script_hash);
 
         let status = self.query.status(&script_hash[..])?;
         let result = status.hash().map_or(Value::Null, |h| json!(hex::encode(h)));
         self.script_hashes.insert(script_hash, result.clone());
-        debug!("Subscribed script_hash: {}", script_hash);
+        info!("Subscribed script_hash: {}", script_hash);
         Ok(())
     }
 
@@ -176,7 +207,7 @@ impl SubscriptionsHandler {
         let old_statushash;
         match self.script_hashes.get(&scripthash) {
             Some(statushash) => {
-                debug!("notify_scripthash_subscriptions: scripthash = {}, statushash = {}, tx_hash = {:?}",
+                info!("notify_scripthash_subscriptions: scripthash = {}, statushash = {}, tx_hash = {:?}",
                    scripthash,
                    statushash,
                    tx_hash_opt
@@ -199,7 +230,7 @@ impl SubscriptionsHandler {
             return Ok(());
         }
 
-        debug!("notify_scripthash_subscriptions: scripthash = {}, old_statushash = {}, new_statushash = {}, tx_hash = {:?}",
+        info!("notify_scripthash_subscriptions: scripthash = {}, old_statushash = {}, new_statushash = {}, tx_hash = {:?}",
            scripthash,
            old_statushash,
            new_statushash,
@@ -221,10 +252,19 @@ impl SubscriptionsHandler {
                 warn!("notify_scripthash_subscriptions error - {}", raw_tx_res.err().unwrap());
                 return Ok(());
             }
+
+            let mut raw_tx = Value::Null;
+
+            let pruned_raw_tx = prune_raw_tx(raw_tx_res.unwrap());
+            if pruned_raw_tx.to_string().len() < 255000 {
+                raw_tx = pruned_raw_tx;
+            }
+
             msg_str = json!({
                 "script_hash": scripthash,
                 "status_hash": new_statushash,
-                "raw_tx": raw_tx_res.unwrap()
+                "raw_tx": raw_tx,
+                "tx_id": tx_id
             }).to_string();
         }
 
@@ -241,7 +281,20 @@ impl SubscriptionsHandler {
 
         match response {
             Ok(res) => debug!("Sent message with body '{}' and created message_id {}", msg_str, res.message_id.unwrap()),
-            Err(error) => debug!("SendMessageError: {:?}", error),
+            Err(error) => {
+                match error {
+                    SendMessageError::InvalidMessageContents(invalid_message) => info!("Error while sending message {}", invalid_message),
+                    SendMessageError::UnsupportedOperation(unsupported) => info!("Error while sending message {}", unsupported),
+                    SendMessageError::HttpDispatch(dispatch) => info!("Error while sending message {:?}", dispatch),
+                    SendMessageError::Credentials(creds) => info!("Error while sending message {:?}", creds),
+                    SendMessageError::Validation(validation) => info!("Error while sending message {}", validation),
+                    SendMessageError::ParseError(err) => info!("Error while sending message {}", err),
+                    SendMessageError::Unknown(buff_res) => {
+                        let error = from_utf8(&buff_res.body).unwrap();
+                        info!("Error while sending message {}", error)
+                    }
+                }
+            }
         }
 
         self.script_hashes.insert(scripthash, new_statushash);
@@ -338,7 +391,7 @@ impl SubscriptionsManager {
                                         None => Value::Null,
                                     };
 
-                                    debug!("subscribing script_hash = {:?}, status_hash = {:?}", script_hash, status_hash);
+                                    info!("subscribing script_hash = {:?}, status_hash = {:?}", script_hash, status_hash);
                                     script_hashes.insert(script_hash, status_hash);
                                 }
                             }
@@ -382,23 +435,25 @@ impl SubscriptionsManager {
         Ok(scripthashes)
     }
 
-    pub fn start(query: Arc<Query>, script_hash_comparison_status: Arc<AtomicBool>) -> SubscriptionsManager {
+    pub fn start(query: Arc<Query>, script_hash_comparison_status: Arc<AtomicBool>, backfill: bool) -> SubscriptionsManager {
         let now = Instant::now();
         let script_hashes = SubscriptionsManager::get_script_hashes()
             .unwrap_or(HashMap::new());
-        debug!("script_hashes.len() = {}, took {} milliseconds", script_hashes.len(), now.elapsed().as_millis());
+        info!("script_hashes.len() = {}, took {} milliseconds", script_hashes.len(), now.elapsed().as_millis());
 
         let env = env::var("ENV").unwrap_or(String::from("dev"));
 
         let mut res = SubscriptionsManager::get_az();
         let az = res.split_off(res.len() - 2).to_uppercase();
 
-        debug!("Create SubscriptionsHandler");
+        info!("Create SubscriptionsHandler");
         let mut subs_handler = SubscriptionsHandler::new(query.clone(), script_hashes.clone(), env.clone());
 
-        let subscribe_sender = subs_handler.chan.sender();
-        SubscriptionsManager::start_subscribe_scripthash_sqs_poller(subscribe_sender, env, az);
-        debug!("Started sqs poller for subscribes");
+        if !backfill {
+            let subscribe_sender = subs_handler.chan.sender();
+            SubscriptionsManager::start_subscribe_scripthash_sqs_poller(subscribe_sender, env, az);
+            info!("Started sqs poller for subscribes");
+        }
 
         let notifications_sender = subs_handler.chan.sender();
 
@@ -409,7 +464,7 @@ impl SubscriptionsManager {
         debug!("comparison_handler created");
 
         spawn_thread("subs_handler", move || subs_handler.handle_replies());
-        debug!("Started SubscriptionsHandler handle_replies");
+        info!("Started SubscriptionsHandler handle_replies");
 
         SubscriptionsManager {
             query: query.clone(),
@@ -476,13 +531,13 @@ impl SubscriptionsManager {
             .sync()
             .expect("Get queue by URL request failed");
 
-        debug!("SQS Poller get queue response {:?}", response);
+        info!("SQS Poller get queue response {:?}", response);
 
         let queue_url = response
             .queue_url
             .expect("Queue url should be available from list queues");
 
-        debug!("SQS Poller queue url {}", queue_url.clone());
+        info!("SQS Poller queue url {}", queue_url.clone());
 
         let receive_request = ReceiveMessageRequest {
             queue_url: queue_url.clone(),
@@ -503,7 +558,7 @@ impl SubscriptionsManager {
 
                         let script_hash_to_sub = message_body.unwrap().Message;
 
-                        debug!("Sending subscription message for scripthash: {}", script_hash_to_sub);
+                        info!("Sending subscription message for scripthash: {}", script_hash_to_sub);
 
                         sender.send(SubscriptionMessage::NewScriptHash(script_hash_to_sub));
 
@@ -512,7 +567,7 @@ impl SubscriptionsManager {
                             receipt_handle: msg.receipt_handle.clone().unwrap(),
                         };
                         match sqs.delete_message(delete_message_request).sync() {
-                            Ok(_) => debug!(
+                            Ok(_) => info!(
                                 "Deleted message via receipt handle {:?}",
                                 msg.receipt_handle
                             ),
