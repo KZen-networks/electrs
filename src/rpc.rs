@@ -290,16 +290,14 @@ impl Connection {
     }
 
     fn start_compare_status_hashes(&mut self) -> Result<Value> {
-        debug!("Call for comparison start");
         if !self.comparison_in_progress.load(Ordering::SeqCst) {
-            debug!("Starting comparison start");
+            info!("Sending message to start script_hash status comparison");
             self.comparison_sender.send(ScriptHashCompareMessage::Start);
         }
         Ok(Value::Null)
     }
 
     fn get_compare_status_hashes_status(&self) -> Result<Value> {
-        debug!("Call for getting comparison status");
         if self.comparison_in_progress.load(Ordering::SeqCst) {
             Ok(Value::String(String::from("IN_PROGRESS")))
         } else {
