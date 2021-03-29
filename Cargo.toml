@@ -24,7 +24,8 @@ latest_rust = []  # use latest Rust features (otherwise, support Rust 1.34)
 [dependencies]
 base64 = "0.10"
 bincode = "1.0"
-bitcoin = { path = "../rust-bitcoin", features = ["use-serde"] }
+# bitcoin = { path = "../rust-bitcoin", features = ["use-serde"] }
+bitcoin = { git = "https://github.com/ZenGo-X/rust-bitcoin", branch = "dogecoin", features = ["use-serde"] }
 bitcoin_hashes = "0.7.6"
 configure_me = "0.3.3"
 crossbeam-channel = "0.3"

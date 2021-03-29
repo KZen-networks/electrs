@@ -207,8 +207,8 @@ impl Config {
             Network::Bitcoin => 50001,
             Network::Testnet => 60001,
             Network::Regtest => 60401,
-            Network::Dogecoin => 60001,
-            Network::Dogetest => 60001,
+            Network::Dogecoin => 50001, // To be consistent with bitcoin electrs
+            Network::Dogetest => 60001, // To be consistnt with bitcoin electrs
         };
         let default_monitoring_port = match config.network {
             Network::Bitcoin => 4224,

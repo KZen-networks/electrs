@@ -19,7 +19,6 @@ pub mod daemon;
 pub mod errors;
 pub mod fake;
 pub mod index;
-// pub mod macs;
 pub mod mempool;
 pub mod metrics;
 pub mod query;
