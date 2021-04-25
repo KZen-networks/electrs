@@ -15,6 +15,7 @@ use std::sync::mpsc::{SyncSender};
 use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use std::time::Instant;
+use itertools::Itertools;
 
 use crate::errors::*;
 use crate::index::compute_script_hash;
@@ -347,6 +348,11 @@ pub struct SubscriptionsManager {
     pub comparison_sender: SyncSender<ScriptHashCompareMessage>,
 }
 
+struct ScriptHashAndTxid {
+    scripthash: FullHash,
+    txid: Txid,
+}
+
 impl SubscriptionsManager {
     fn get_az() -> String {
         let res = reqwest::blocking::get("http://instance-data/latest/meta-data/placement/availability-zone");
@@ -486,15 +492,15 @@ impl SubscriptionsManager {
         txs_changed: HashSet<Txid>,
     ) {
         let mut txn_done: HashSet<Txid> = HashSet::new();
-        let mut scripthashes: HashMap<FullHash, Txid> = HashMap::new();
+        let mut scripthashes: Vec<ScriptHashAndTxid> = Vec::new();
 
         let mut insert_for_tx = |txid, blockhash| {
             if !txn_done.insert(txid) {
                 return;
             }
             if let Ok(hashes) = self.get_scripthashes_effected_by_tx(&txid, blockhash) {
-                for h in hashes {
-                    scripthashes.insert(h, txid);
+                for h in hashes.iter().unique() {
+                    scripthashes.push(ScriptHashAndTxid { scripthash: *h, txid });
                 }
             } else {
                 warn!("failed to get effected scripthashes for tx {}", txid);
@@ -518,7 +524,9 @@ impl SubscriptionsManager {
             insert_for_tx(txid, None);
         }
 
-        for (scripthash, txid) in scripthashes.drain() {
+        for scripthash_and_txid in scripthashes.drain(..) {
+            let scripthash = scripthash_and_txid.scripthash;
+            let txid = scripthash_and_txid.txid;
             self.notifications_sender.send(SubscriptionMessage::ScriptHashChange(scripthash, Some(txid.into_inner())));
         }
     }
