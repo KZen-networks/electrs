@@ -234,7 +234,7 @@ impl SubscriptionsHandler {
         }
         let status = status_result.unwrap();
         let new_statushash = status.hash().map_or(Value::Null, |h| json!(hex::encode(h)));
-        if new_statushash == *old_statushash {
+        if tx_hash_opt.is_none() && new_statushash == *old_statushash {
             return Ok(());
         }
 
