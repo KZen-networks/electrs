@@ -495,14 +495,12 @@ impl SubscriptionsManager {
         let mut scripthashes: Vec<ScriptHashAndTxid> = Vec::new();
 
         let mut insert_for_tx = |txid, blockhash| {
-            info!("on_scripthash_change::insert_for_tx: txid = {}, blockhash = {:?}", txid, blockhash);
             if !txn_done.insert(txid) {
                 return;
             }
             if let Ok(hashes) = self.get_scripthashes_effected_by_tx(&txid, blockhash) {
                 for h in hashes.iter().unique() {
                     let scripthash = Sha256dHash::from_slice(&h[..]).expect("invalid scripthash");
-                    info!("on_scripthash_change::insert_for_tx: txid = {}, blockhash = {:?}, scripthash = {}", txid, blockhash, scripthash);
                     scripthashes.push(ScriptHashAndTxid { scripthash: *h, txid });
                 }
             } else {
