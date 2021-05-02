@@ -500,7 +500,6 @@ impl SubscriptionsManager {
             }
             if let Ok(hashes) = self.get_scripthashes_effected_by_tx(&txid, blockhash) {
                 for h in hashes.iter().unique() {
-                    let scripthash = Sha256dHash::from_slice(&h[..]).expect("invalid scripthash");
                     scripthashes.push(ScriptHashAndTxid { scripthash: *h, txid });
                 }
             } else {
