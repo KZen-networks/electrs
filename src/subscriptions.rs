@@ -375,7 +375,7 @@ impl SubscriptionsManager {
         loop {
             // loop until no more pages (1MB limit)
             let scan_input = ScanInput {
-                table_name: format!("{}_AddressInfo", env::var("ENV").unwrap_or(String::from("dev"))),
+                table_name: format!("{}_DogeAddressInfo", env::var("ENV").unwrap_or(String::from("dev"))),
                 projection_expression: Some(String::from("electrumHash, #statusHash")),
                 expression_attribute_names: Some(expression_attribute_names.clone()),
                 exclusive_start_key: last_evaluated_key.clone(),
