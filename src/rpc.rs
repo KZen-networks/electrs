@@ -1,26 +1,23 @@
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hash_types::{BlockHash, Txid};
 use bitcoin_hashes::hex::{FromHex, ToHex};
 use bitcoin_hashes::{sha256d::Hash as Sha256dHash, Hash};
 use error_chain::ChainedError;
 use hex;
 use serde_json::{from_str, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
 
 use crate::errors::*;
-use crate::index::compute_script_hash;
-use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
+use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
 use crate::query::{Query, Status};
-use crate::util::FullHash;
+use crate::subscriptions::{ScriptHashCompareMessage};
 use crate::util::{spawn_thread, Channel, HeaderEntry, SyncChannel};
-use crate::subscriptions::SubscriptionsManager;
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: &str = "1.4";
@@ -74,26 +71,16 @@ fn unspent_from_status(status: &Status) -> Value {
     ))
 }
 
-fn get_output_scripthash(txn: &Transaction, n: Option<usize>) -> Vec<FullHash> {
-    if let Some(out) = n {
-        vec![compute_script_hash(&txn.output[out].script_pubkey[..])]
-    } else {
-        txn.output
-            .iter()
-            .map(|o| compute_script_hash(&o.script_pubkey[..]))
-            .collect()
-    }
-}
-
 struct Connection {
     query: Arc<Query>,
     last_header_entry: Option<HeaderEntry>,
-    script_hashes: HashMap<Sha256dHash, Value>, // ScriptHash -> StatusHash
     stream: TcpStream,
     addr: SocketAddr,
     chan: SyncChannel<Message>,
     stats: Arc<Stats>,
     relayfee: f64,
+    comparison_sender: SyncSender<ScriptHashCompareMessage>,
+    comparison_in_progress: Arc<AtomicBool>
 }
 
 impl Connection {
@@ -103,20 +90,19 @@ impl Connection {
         addr: SocketAddr,
         stats: Arc<Stats>,
         relayfee: f64,
+        comparison_sender: SyncSender<ScriptHashCompareMessage>,
+        comparison_in_progress: Arc<AtomicBool>
     ) -> Connection {
-        let now = Instant::now();
-        let script_hashes = SubscriptionsManager::get_script_hashes()
-            .unwrap_or(HashMap::new());
-        debug!("script_hashes.len() = {}, took {} milliseconds", script_hashes.len(), now.elapsed().as_millis());
         Connection {
             query,
             last_header_entry: None, // disable header subscription for now
-            script_hashes,
             stream,
             addr,
             chan: SyncChannel::new(10),
             stats,
             relayfee,
+            comparison_sender,
+            comparison_in_progress
         }
     }
 
@@ -225,19 +211,6 @@ impl Connection {
         Ok(json!(self.relayfee)) // in BTC/kB
     }
 
-    fn blockchain_scripthash_subscribe(&mut self, params: &[Value]) -> Result<Value> {
-        let script_hash =
-            hash_from_value::<Sha256dHash>(params.get(0)).chain_err(|| "bad script_hash")?;
-        debug!("blockchain_scripthash_subscribe: script_hash = {}", script_hash);
-        let status = self.query.status(&script_hash[..])?;
-        let result = status.hash().map_or(Value::Null, |h| json!(hex::encode(h)));
-        self.script_hashes.insert(script_hash, result.clone());
-        self.stats
-            .subscriptions
-            .set(self.script_hashes.len() as i64);
-        Ok(result)
-    }
-
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
         let script_hash =
             hash_from_value::<Sha256dHash>(params.get(0)).chain_err(|| "bad script_hash")?;
@@ -316,6 +289,22 @@ impl Connection {
             "merkle" : merkle_vec}))
     }
 
+    fn start_compare_status_hashes(&mut self) -> Result<Value> {
+        if !self.comparison_in_progress.load(Ordering::SeqCst) {
+            info!("Sending message to start script_hash status comparison");
+            self.comparison_sender.send(ScriptHashCompareMessage::Start);
+        }
+        Ok(Value::Null)
+    }
+
+    fn get_compare_status_hashes_status(&self) -> Result<Value> {
+        if self.comparison_in_progress.load(Ordering::SeqCst) {
+            Ok(Value::String(String::from("IN_PROGRESS")))
+        } else {
+            Ok(Value::String(String::from("DONE")))
+        }
+    }
+
     fn handle_command(&mut self, method: &str, params: &[Value], id: &Value) -> Result<Value> {
         let timer = self
             .stats
@@ -331,19 +320,20 @@ impl Connection {
             "blockchain.scripthash.get_balance" => self.blockchain_scripthash_get_balance(&params),
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(&params),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(&params),
-            "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
             "blockchain.transaction.broadcast" => self.blockchain_transaction_broadcast(&params),
             "blockchain.transaction.get" => self.blockchain_transaction_get(&params),
             "blockchain.transaction.get_merkle" => self.blockchain_transaction_get_merkle(&params),
             "blockchain.transaction.id_from_pos" => {
                 self.blockchain_transaction_id_from_pos(&params)
-            }
+            },
             "mempool.get_fee_histogram" => self.mempool_get_fee_histogram(),
             "server.banner" => self.server_banner(),
             "server.donation_address" => self.server_donation_address(),
             "server.peers.subscribe" => self.server_peers_subscribe(),
             "server.ping" => Ok(Value::Null),
             "server.version" => self.server_version(),
+            "statushash.compare.start" => self.start_compare_status_hashes(),
+            "statushash.compare.status" => self.get_compare_status_hashes_status(),
             &_ => bail!("unknown method {} {:?}", method, params),
         };
         timer.observe_duration();
@@ -361,58 +351,6 @@ impl Connection {
                 json!({"jsonrpc": "2.0", "id": id, "error": format!("{}", e)})
             }
         })
-    }
-
-    fn on_scripthash_change(&mut self, scripthash: FullHash, txid_opt: Option<FullHash>) -> Result<()> {
-        let scripthash = Sha256dHash::from_slice(&scripthash[..]).expect("invalid scripthash");
-        let txid_opt = txid_opt.map(|txid| Sha256dHash::from_slice(&txid[..]).expect("invalid txid"));
-
-        let old_statushash;
-        match self.script_hashes.get(&scripthash) {
-            Some(statushash) => {
-                debug!("on_scripthash_change: scripthash = {}, statushash = {}{}",
-                    scripthash,
-                    statushash,
-                    txid_opt.map_or("".to_string(), |txid| format!(", txid = {}", txid))
-                );
-                old_statushash = statushash;
-            }
-            None => {
-                return Ok(());
-            }
-        };
-
-        let timer = self
-            .stats
-            .latency
-            .with_label_values(&["statushash_update"])
-            .start_timer();
-
-        let status_result = self.query.status(&scripthash[..]);
-        if status_result.is_err() {
-            warn!("on_scripthash_change error - {}", status_result.err().unwrap());
-            return Ok(());
-        }
-        let status = status_result.unwrap();
-        let new_statushash = status.hash().map_or(Value::Null, |h| json!(hex::encode(h)));
-        if new_statushash == *old_statushash {
-            return Ok(());
-        }
-        timer.observe_duration();
-
-        debug!("ScriptHash change: scripthash = {}, old_statushash = {}, new_statushash = {}{}",
-            scripthash,
-            old_statushash,
-            new_statushash,
-            txid_opt.map_or("".to_string(), |txid| format!(", txid = {}", txid))
-        );
-
-        self.send_values(&vec![json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.scripthash.subscribe",
-            "params": [scripthash.to_hex(), new_statushash]})])?;
-        self.script_hashes.insert(scripthash, new_statushash);
-        Ok(())
     }
 
     fn on_chaintip_change(&mut self, chaintip: HeaderEntry) -> Result<()> {
@@ -474,7 +412,6 @@ impl Connection {
                     };
                     self.send_values(&[reply])?
                 }
-                Message::ScriptHashChange(hash, txid) => self.on_scripthash_change(hash, txid)?,
                 Message::ChainTipChange(tip) => self.on_chaintip_change(tip)?,
                 Message::Done => return Ok(()),
             }
@@ -509,55 +446,10 @@ impl Connection {
         }
     }
 
-    fn compare_status_hashes(script_hashes: HashMap<Sha256dHash, Value>, query: Arc<Query>, tx: SyncSender<Message>, connection: SyncChannel<Message>) -> Result<()> {
-        debug!("compare_status_hashes: script_hashes.len() = {}, starting", script_hashes.len());
-        let now = Instant::now();
-        let rx = connection.receiver();
-        for (i, (scripthash, old_statushash)) in script_hashes.iter().enumerate() {
-            if i % 1000 == 0 {
-                debug!("compare_status_hashes: comparing {} out of {}", i, script_hashes.len());
-                match rx.try_recv() {
-                    Ok(_) | Err(TryRecvError::Disconnected) => {
-                        debug!("compare_status_hashes: channel is closed, shutting down");
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => {}
-                }
-            }
-
-            let scripthash_buffer = scripthash.into_inner();
-            let status_result = query.status(&scripthash_buffer);
-            if status_result.is_err() {
-                warn!("compare_status_hashes error - {}", status_result.err().unwrap());
-                continue;
-            }
-            let status = status_result.unwrap();
-            let new_statushash = status.hash().map_or(Value::Null, |h| json!(hex::encode(h)));
-            if new_statushash == *old_statushash {
-                continue;
-            }
-
-            debug!("compare_status_hashes: found diff. scripthash = {}, old_statushash = {}, new_statushash = {}", scripthash, old_statushash, new_statushash);
-            if let Err(_) = tx.send(Message::ScriptHashChange(scripthash_buffer, None)) {
-                debug!("compare_status_hashes: send failed because the channel is closed, shutting down")
-            }
-        }
-
-        debug!("compare_status_hashes: script_hashes.len() = {}, took {} seconds", script_hashes.len(), now.elapsed().as_secs());
-        Ok(())
-    }
-
     pub fn run(mut self) {
         let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
         let tx = self.chan.sender();
         let reader_child = spawn_thread("reader", || Connection::handle_requests(reader, tx));
-
-        let script_hashes = self.script_hashes.clone();
-        let query = Arc::clone(&self.query);
-        let tx2 = self.chan.sender();
-        let shutdown_channel = SyncChannel::new(1);
-        let shutdown_sender = shutdown_channel.sender();
-        spawn_thread("status_hashes_comparer", || Connection::compare_status_hashes(script_hashes, query, tx2, shutdown_channel));
 
         if let Err(e) = self.handle_replies() {
             error!(
@@ -568,7 +460,6 @@ impl Connection {
         }
         debug!("[{}] shutting down connection", self.addr);
         let _ = self.stream.shutdown(Shutdown::Both);
-        let _ = shutdown_sender.send(Message::Done);
         if let Err(err) = reader_child.join().expect("receiver panicked") {
             error!("[{}] receiver failed: {}", self.addr, err);
         }
@@ -578,13 +469,11 @@ impl Connection {
 #[derive(Debug)]
 pub enum Message {
     Request(String),
-    ScriptHashChange(FullHash, Option<FullHash>),
     ChainTipChange(HeaderEntry),
     Done,
 }
 
 pub enum Notification {
-    ScriptHashChange(FullHash, FullHash),
     ChainTipChange(HeaderEntry),
     Exit,
 }
@@ -592,12 +481,10 @@ pub enum Notification {
 pub struct RPC {
     notification: Sender<Notification>,
     server: Option<thread::JoinHandle<()>>, // so we can join the server while dropping this ojbect
-    query: Arc<Query>,
 }
 
 struct Stats {
     latency: HistogramVec,
-    subscriptions: Gauge,
 }
 
 impl RPC {
@@ -610,18 +497,6 @@ impl RPC {
             for msg in notification.receiver().iter() {
                 let mut senders = senders.lock().unwrap();
                 match msg {
-                    Notification::ScriptHashChange(hash, txid) => {
-                        senders.retain(|sender| {
-                            if let Err(e) =
-                                sender.send(Message::ScriptHashChange(hash, Some(txid)))
-                            {
-                                warn!("ScriptHashChange failed with error = {}", e);
-                                false // drop disconnected clients
-                            } else {
-                                true
-                            }
-                        })
-                    },
                     Notification::ChainTipChange(hash) => {
                         senders.retain(|sender| {
                             if let Err(e) =
@@ -661,22 +536,17 @@ impl RPC {
         chan
     }
 
-    pub fn start(addr: SocketAddr, query: Arc<Query>, metrics: &Metrics, relayfee: f64) -> RPC {
+    pub fn start(addr: SocketAddr, query: Arc<Query>, metrics: &Metrics, relayfee: f64, comparison_sender: SyncSender<ScriptHashCompareMessage>, comparison_status: Arc<AtomicBool>) -> RPC {
         let stats = Arc::new(Stats {
             latency: metrics.histogram_vec(
                 HistogramOpts::new("electrs_electrum_rpc", "Electrum RPC latency (seconds)"),
                 &["method"],
             ),
-            subscriptions: metrics.gauge(MetricOpts::new(
-                "electrs_electrum_subscriptions",
-                "# of Electrum subscriptions",
-            )),
         });
         let notification = Channel::unbounded();
 
         RPC {
             notification: notification.sender(),
-            query: query.clone(),
             server: Some(spawn_thread("rpc", move || {
                 let senders = Arc::new(Mutex::new(Vec::<SyncSender<Message>>::new()));
 
@@ -691,11 +561,13 @@ impl RPC {
                     let query = Arc::clone(&query);
                     let senders = Arc::clone(&senders);
                     let stats = Arc::clone(&stats);
+                    let comparison_sender = comparison_sender.clone();
                     let garbage_sender = garbage_sender.clone();
+                    let comparison_status = comparison_status.clone();
 
                     let spawned = spawn_thread("peer", move || {
                         info!("[{}] connected peer", addr);
-                        let conn = Connection::new(query, stream, addr, stats, relayfee);
+                        let conn = Connection::new(query, stream, addr, stats, relayfee, comparison_sender, comparison_status);
                         senders.lock().unwrap().push(conn.chan.sender());
                         conn.run();
                         info!("[{}] disconnected peer", addr);
@@ -729,76 +601,10 @@ impl RPC {
         }
     }
 
-    pub fn notify_scripthash_subscriptions(
-        &self,
-        headers_changed: &Vec<HeaderEntry>,
-        txs_changed: HashSet<Txid>,
-    ) {
-        let mut txn_done: HashSet<Txid> = HashSet::new();
-        let mut scripthashes: HashMap<FullHash, Txid> = HashMap::new();
-
-        let mut insert_for_tx = |txid, blockhash| {
-            if !txn_done.insert(txid) {
-                return;
-            }
-            if let Ok(hashes) = self.get_scripthashes_effected_by_tx(&txid, blockhash) {
-                for h in hashes {
-                    scripthashes.insert(h, txid);
-                }
-            } else {
-                warn!("failed to get effected scripthashes for tx {}", txid);
-            }
-        };
-
-        for header in headers_changed {
-            let blockhash = header.hash();
-            let txids = match self.query.get_block_txids(&blockhash) {
-                Ok(txids) => txids,
-                Err(e) => {
-                    warn!("Failed to get blocktxids for {}: {}", blockhash, e);
-                    continue;
-                }
-            };
-            for txid in txids {
-                insert_for_tx(txid, Some(*blockhash));
-            }
-        }
-        for txid in txs_changed {
-            insert_for_tx(txid, None);
-        }
-
-        for (scripthash, txid) in scripthashes.drain() {
-            if let Err(e) = self.notification.send(Notification::ScriptHashChange(scripthash, txid.into_inner())) {
-                warn!("Scripthash change notification failed: {}", e);
-            }
-        }
-    }
-
     pub fn notify_subscriptions_chaintip(&self, header: HeaderEntry) {
         if let Err(e) = self.notification.send(Notification::ChainTipChange(header)) {
             warn!("Failed to notify about chaintip change {}", e);
         }
-    }
-
-    fn get_scripthashes_effected_by_tx(
-        &self,
-        txid: &Txid,
-        blockhash: Option<BlockHash>,
-    ) -> Result<Vec<FullHash>> {
-        let txn = self.query.load_txn_with_blockhashlookup(txid, blockhash)?;
-        let mut scripthashes = get_output_scripthash(&txn, None);
-
-        for txin in txn.input {
-            if txin.previous_output.is_null() {
-                continue;
-            }
-            let id: &Txid = &txin.previous_output.txid;
-            let n = txin.previous_output.vout as usize;
-
-            let txn = self.query.load_txn_with_blockhashlookup(&id, None)?;
-            scripthashes.extend(get_output_scripthash(&txn, Some(n)));
-        }
-        Ok(scripthashes)
     }
 }
 
