@@ -24,6 +24,7 @@ use crate::util::{spawn_thread, SyncChannel, HeaderEntry, FullHash};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::str::from_utf8;
 use std::error::Error;
+use uuid::Uuid;
 
 const TX_SIZE_THRESHOLD: usize = 255_000;
 
@@ -278,7 +279,7 @@ impl SubscriptionsHandler {
 
         let send_msg_request = SendMessageRequest {
             message_body: msg_str.clone(),
-            message_group_id: Option::from(String::from(new_statushash.clone().as_str().unwrap())),
+            message_group_id: Option::from(String::from(new_statushash.clone().as_str().unwrap_or(&Uuid::new_v4().to_hyphenated().to_string()))),
             queue_url: self.tx_notification_url.clone(),
             ..Default::default()
         };
