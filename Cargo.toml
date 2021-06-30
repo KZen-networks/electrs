@@ -54,6 +54,7 @@ rusoto_core = "0.36.0"
 rusoto_dynamodb = "0.36.0"
 rusoto_sqs = "0.36.0"
 reqwest = { version = "0.10.0", features = ["blocking"] }
+uuid = { version = "0.8", features = ["serde", "v4"] }
 
 [build-dependencies]
 configure_me_codegen = "0.3.12"
